@@ -20,7 +20,7 @@ RISK_PER_TRADE   = 0.02
 ATR_SL_MULT      = 1.0
 ATR_TP_MULT      = 2.0
 MIN_SCORE        = 70
-REFRESH_SECONDS  = 120
+REFRESH_SECONDS  = 60
 LOG_FILE         = "trades_log.json"
 
 app = Flask(__name__)
@@ -78,7 +78,7 @@ def refresh_loop():
             updated={}
             for sym in STOCKS:
                 try:
-                    df=yf.download(sym,period="1y",interval="1d",progress=False,auto_adjust=True)
+                    df = yf.download(sym, period="6mo", interval="1d", progress=False, auto_adjust=True, timeout=30)
                     if df is None or len(df)<30: continue
                     df.columns=df.columns.get_level_values(0) if isinstance(df.columns,pd.MultiIndex) else df.columns
                     updated[sym]=score_stock(df)
