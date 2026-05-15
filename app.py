@@ -1,8 +1,7 @@
 """
-AI Paper Trading Algo — Mobile Edition (Fixed for Render/Cloud)
-Uses proper headers to bypass Yahoo Finance rate limiting
+AI Paper Trading Algo — Mobile Edition
+Uses direct Yahoo Finance API (no yfinance needed)
 """
-
 import json, os, time, threading, datetime, requests
 from flask import Flask, render_template_string, jsonify, request
 import pandas as pd
@@ -18,7 +17,7 @@ RISK_PER_TRADE   = 0.02
 ATR_SL_MULT      = 1.0
 ATR_TP_MULT      = 2.0
 MIN_SCORE        = 70
-REFRESH_SECONDS  = 180
+REFRESH_SECONDS  = 300
 LOG_FILE         = "trades_log.json"
 
 app = Flask(__name__)
@@ -29,76 +28,58 @@ state = {
 }
 lock = threading.Lock()
 
-# ── YAHOO FINANCE FETCH WITH PROPER HEADERS ──
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "DNT": "1",
-    "Connection": "keep-alive",
-}
-
-def fetch_yahoo(sym, period="6mo"):
-    """Fetch OHLCV data from Yahoo Finance with proper headers"""
-    try:
-        import yfinance as yf
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        ticker = yf.Ticker(sym, session=session)
-        df = ticker.history(period=period, interval="1d", auto_adjust=True)
-        if df is not None and len(df) >= 30:
-            return df
-    except Exception as e:
-        print(f"  yfinance failed for {sym}: {e}")
-    
-    # Fallback: direct Yahoo Finance API
-    try:
-        end = int(time.time())
-        start = end - 180 * 86400
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-        params = {"period1": start, "period2": end, "interval": "1d", "range": "6mo"}
-        r = requests.get(url, headers=HEADERS, params=params, timeout=15)
-        data = r.json()
-        timestamps = data["chart"]["result"][0]["timestamp"]
-        ohlcv = data["chart"]["result"][0]["indicators"]["quote"][0]
-        adjclose = data["chart"]["result"][0]["indicators"]["adjclose"][0]["adjclose"]
-        df = pd.DataFrame({
-            "Open":   ohlcv["open"],
-            "High":   ohlcv["high"],
-            "Low":    ohlcv["low"],
-            "Close":  adjclose,
-            "Volume": ohlcv["volume"],
-        }, index=pd.to_datetime(timestamps, unit="s", utc=True))
-        df = df.dropna()
-        if len(df) >= 30:
-            return df
-    except Exception as e:
-        print(f"  Direct fetch failed for {sym}: {e}")
-    
+def fetch_yahoo(sym):
+    urls = [
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}",
+    ]
+    params = {"interval": "1d", "range": "6mo"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=20)
+            if r.status_code != 200:
+                print(f"  {sym} HTTP {r.status_code}")
+                continue
+            data = r.json()
+            result = data["chart"]["result"][0]
+            timestamps = result["timestamp"]
+            q = result["indicators"]["quote"][0]
+            try:
+                closes = result["indicators"]["adjclose"][0]["adjclose"]
+            except:
+                closes = q["close"]
+            df = pd.DataFrame({
+                "Open": q["open"], "High": q["high"],
+                "Low": q["low"], "Close": closes, "Volume": q["volume"],
+            }, index=pd.to_datetime(timestamps, unit="s"))
+            df = df.dropna()
+            if len(df) >= 30:
+                print(f"  OK {sym} price={round(float(df['Close'].iloc[-1]),2)}")
+                return df
+        except Exception as e:
+            print(f"  {sym} error: {e}")
     return None
 
-# ── TECHNICAL INDICATORS ──────────────────────
 def ema(s, p): return s.ewm(span=p, adjust=False).mean()
-
 def rsi_calc(s, p=14):
     d=s.diff(); g=d.clip(lower=0).ewm(com=p-1,adjust=False).mean()
     l=(-d.clip(upper=0)).ewm(com=p-1,adjust=False).mean()
     r=100-100/(1+g/l.replace(0,np.nan))
     return float(r.iloc[-1]) if not r.empty else 50.0
-
 def macd_calc(s):
     line=ema(s,12)-ema(s,26); sig=ema(line,9)
     return float(line.iloc[-1]), float(sig.iloc[-1])
-
 def atr_calc(df, p=14):
     h,l,c=df["High"],df["Low"],df["Close"]
     tr=pd.concat([(h-l),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
     return float(tr.ewm(com=p-1,adjust=False).mean().iloc[-1])
 
 def score_stock(df):
-    c=df["Close"]; v=df["Volume"]
-    px=float(c.iloc[-1])
+    c=df["Close"]; v=df["Volume"]; px=float(c.iloc[-1])
     e9,e21,e50,e200=[float(ema(c,p).iloc[-1]) for p in [9,21,50,200]]
     r=rsi_calc(c); ml,ms=macd_calc(c); a=atr_calc(df)
     avg_v=float(v.iloc[-21:-1].mean()) if len(v)>21 else float(v.mean())
@@ -113,8 +94,7 @@ def score_stock(df):
     if vr>=1.3: sc+=10; rsns.append(f"Vol {vr:.1f}x")
     if bw>bwp and px>float(bb_m.iloc[-1]): sc+=15; rsns.append("BB breakout")
     sig="BUY" if sc>=MIN_SCORE else ("WATCH" if sc>=50 else "HOLD")
-    sl=px-ATR_SL_MULT*a; tgt=px+ATR_TP_MULT*a
-    rr=(tgt-px)/max(px-sl,0.01)
+    sl=px-ATR_SL_MULT*a; tgt=px+ATR_TP_MULT*a; rr=(tgt-px)/max(px-sl,0.01)
     chg=(px-float(c.iloc[-2]))/float(c.iloc[-2])*100 if len(c)>=2 else 0
     return dict(price=round(px,2),score=sc,signal=sig,rsi=round(r,1),
                 entry=round(px,2),sl=round(sl,2),target=round(tgt,2),
@@ -122,38 +102,29 @@ def score_stock(df):
                 change_pct=round(chg,2),macd_bull=ml>ms,
                 trend_bull=px>e200,ema_align=e9>e21>e50)
 
-# ── BACKGROUND REFRESH ────────────────────────
 def refresh_loop():
-    time.sleep(3)  # wait for server to fully start
+    time.sleep(2)
     while True:
         try:
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Fetching stocks...")
             with lock: state["status"]="refreshing"
             updated={}
             for sym in STOCKS:
                 try:
-                    print(f"  Fetching {sym}...")
-                    df = fetch_yahoo(sym)
-                    if df is None or len(df)<30:
-                        print(f"  No data for {sym}")
-                        continue
-                    updated[sym] = score_stock(df)
-                    print(f"  OK {sym} = {updated[sym]['price']}")
-                    time.sleep(1)  # be nice to Yahoo
+                    df=fetch_yahoo(sym)
+                    if df is not None: updated[sym]=score_stock(df)
+                    time.sleep(2)
                 except Exception as e:
-                    print(f"  Error {sym}: {e}")
-            
+                    print(f"  score error {sym}: {e}")
             now=datetime.datetime.now().strftime("%d %b %H:%M")
             with lock:
-                if updated:
-                    state["market_data"]=updated
-                    state["status"]="live"
-                else:
-                    state["status"]="error"
+                state["market_data"]=updated if updated else state["market_data"]
+                state["status"]="live" if updated else "error"
                 state["last_refresh"]=now
             _check_exits()
-            print(f"[{now}] Done. {len(updated)}/{len(STOCKS)} stocks loaded")
+            print(f"Done: {len(updated)} stocks loaded")
         except Exception as e:
-            print(f"Refresh error: {e}")
+            print(f"Loop error: {e}")
             with lock: state["status"]="error"
         time.sleep(REFRESH_SECONDS)
 
@@ -196,7 +167,6 @@ def _load():
             if k in d: state[k]=d[k]
     except: pass
 
-# ── API ROUTES ────────────────────────────────
 @app.route("/api/state")
 def api_state():
     with lock:
@@ -219,11 +189,11 @@ def api_buy():
     with lock:
         if sym in state["positions"]: return jsonify(ok=False,msg="Already holding")
         d=state["market_data"].get(sym)
-        if not d: return jsonify(ok=False,msg="No data yet")
+        if not d: return jsonify(ok=False,msg="Prices loading, please wait")
         px=d["entry"]; sl=d["sl"]; tgt=d["target"]
         risk=state["capital"]*RISK_PER_TRADE; rps=max(px-sl,0.01)
         qty=max(1,int(risk/rps)); cost=qty*px
-        if cost>state["capital"]: return jsonify(ok=False,msg="Low funds")
+        if cost>state["capital"]: return jsonify(ok=False,msg="Insufficient funds")
         state["capital"]-=cost
         state["positions"][sym]=dict(qty=qty,entry=round(px,2),sl=round(sl,2),
             target=round(tgt,2),cost=round(cost,2),
@@ -258,5 +228,5 @@ if __name__ == "__main__":
     t=threading.Thread(target=refresh_loop,daemon=True)
     t.start()
     port=int(os.environ.get("PORT",5050))
-    print(f"Starting on http://localhost:{port}")
+    print(f"Server started on port {port}")
     app.run(host="0.0.0.0",port=port,debug=False,use_reloader=False)
