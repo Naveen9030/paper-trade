@@ -82,7 +82,7 @@ def do_refresh():
             del df
             time.sleep(2)
         except Exception as e: print(f"  err {sym}: {e}")
-    now=datetime.datetime.now().strftime("%d %b %H:%M")
+    now=(datetime.datetime.now()+datetime.timedelta(hours=5,minutes=30)).strftime("%d %b %H:%M IST")
     with LK:
         if out:
             S["market_data"]=out
