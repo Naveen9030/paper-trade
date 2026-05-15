@@ -1,12 +1,10 @@
 """
-AI Paper Trading Algo — Mobile Edition
-Deploy free on Railway.app or Render.com
-Access from any phone browser — no install needed
+AI Paper Trading Algo — Mobile Edition (Fixed for Render/Cloud)
+Uses proper headers to bypass Yahoo Finance rate limiting
 """
 
-import json, os, time, threading, datetime
+import json, os, time, threading, datetime, requests
 from flask import Flask, render_template_string, jsonify, request
-import yfinance as yf
 import pandas as pd
 import numpy as np
 
@@ -20,7 +18,7 @@ RISK_PER_TRADE   = 0.02
 ATR_SL_MULT      = 1.0
 ATR_TP_MULT      = 2.0
 MIN_SCORE        = 70
-REFRESH_SECONDS  = 60
+REFRESH_SECONDS  = 180
 LOG_FILE         = "trades_log.json"
 
 app = Flask(__name__)
@@ -31,15 +29,68 @@ state = {
 }
 lock = threading.Lock()
 
+# ── YAHOO FINANCE FETCH WITH PROPER HEADERS ──
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+}
+
+def fetch_yahoo(sym, period="6mo"):
+    """Fetch OHLCV data from Yahoo Finance with proper headers"""
+    try:
+        import yfinance as yf
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        ticker = yf.Ticker(sym, session=session)
+        df = ticker.history(period=period, interval="1d", auto_adjust=True)
+        if df is not None and len(df) >= 30:
+            return df
+    except Exception as e:
+        print(f"  yfinance failed for {sym}: {e}")
+    
+    # Fallback: direct Yahoo Finance API
+    try:
+        end = int(time.time())
+        start = end - 180 * 86400
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+        params = {"period1": start, "period2": end, "interval": "1d", "range": "6mo"}
+        r = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        data = r.json()
+        timestamps = data["chart"]["result"][0]["timestamp"]
+        ohlcv = data["chart"]["result"][0]["indicators"]["quote"][0]
+        adjclose = data["chart"]["result"][0]["indicators"]["adjclose"][0]["adjclose"]
+        df = pd.DataFrame({
+            "Open":   ohlcv["open"],
+            "High":   ohlcv["high"],
+            "Low":    ohlcv["low"],
+            "Close":  adjclose,
+            "Volume": ohlcv["volume"],
+        }, index=pd.to_datetime(timestamps, unit="s", utc=True))
+        df = df.dropna()
+        if len(df) >= 30:
+            return df
+    except Exception as e:
+        print(f"  Direct fetch failed for {sym}: {e}")
+    
+    return None
+
+# ── TECHNICAL INDICATORS ──────────────────────
 def ema(s, p): return s.ewm(span=p, adjust=False).mean()
+
 def rsi_calc(s, p=14):
     d=s.diff(); g=d.clip(lower=0).ewm(com=p-1,adjust=False).mean()
     l=(-d.clip(upper=0)).ewm(com=p-1,adjust=False).mean()
     r=100-100/(1+g/l.replace(0,np.nan))
     return float(r.iloc[-1]) if not r.empty else 50.0
+
 def macd_calc(s):
     line=ema(s,12)-ema(s,26); sig=ema(line,9)
     return float(line.iloc[-1]), float(sig.iloc[-1])
+
 def atr_calc(df, p=14):
     h,l,c=df["High"],df["Low"],df["Close"]
     tr=pd.concat([(h-l),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
@@ -71,27 +122,38 @@ def score_stock(df):
                 change_pct=round(chg,2),macd_bull=ml>ms,
                 trend_bull=px>e200,ema_align=e9>e21>e50)
 
+# ── BACKGROUND REFRESH ────────────────────────
 def refresh_loop():
+    time.sleep(3)  # wait for server to fully start
     while True:
         try:
             with lock: state["status"]="refreshing"
             updated={}
             for sym in STOCKS:
                 try:
-                    df = yf.download(sym, period="6mo", interval="1d", progress=False, auto_adjust=True, timeout=30)
-                    if df is None or len(df)<30: continue
-                    df.columns=df.columns.get_level_values(0) if isinstance(df.columns,pd.MultiIndex) else df.columns
-                    updated[sym]=score_stock(df)
-                except: pass
+                    print(f"  Fetching {sym}...")
+                    df = fetch_yahoo(sym)
+                    if df is None or len(df)<30:
+                        print(f"  No data for {sym}")
+                        continue
+                    updated[sym] = score_stock(df)
+                    print(f"  OK {sym} = {updated[sym]['price']}")
+                    time.sleep(1)  # be nice to Yahoo
+                except Exception as e:
+                    print(f"  Error {sym}: {e}")
+            
             now=datetime.datetime.now().strftime("%d %b %H:%M")
             with lock:
-                state["market_data"]=updated
+                if updated:
+                    state["market_data"]=updated
+                    state["status"]="live"
+                else:
+                    state["status"]="error"
                 state["last_refresh"]=now
-                state["status"]="live"
             _check_exits()
-            print(f"[{now}] Refreshed {len(updated)} stocks")
+            print(f"[{now}] Done. {len(updated)}/{len(STOCKS)} stocks loaded")
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Refresh error: {e}")
             with lock: state["status"]="error"
         time.sleep(REFRESH_SECONDS)
 
@@ -134,6 +196,7 @@ def _load():
             if k in d: state[k]=d[k]
     except: pass
 
+# ── API ROUTES ────────────────────────────────
 @app.route("/api/state")
 def api_state():
     with lock:
@@ -186,7 +249,6 @@ def api_reset():
         _save()
     return jsonify(ok=True)
 
-
 @app.route("/")
 def index():
     return render_template_string(open("mobile_ui.html").read())
@@ -196,5 +258,5 @@ if __name__ == "__main__":
     t=threading.Thread(target=refresh_loop,daemon=True)
     t.start()
     port=int(os.environ.get("PORT",5050))
-    print(f"Open http://localhost:{port} on your phone browser")
+    print(f"Starting on http://localhost:{port}")
     app.run(host="0.0.0.0",port=port,debug=False,use_reloader=False)
